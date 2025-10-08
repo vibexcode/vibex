@@ -1,0 +1,394 @@
+# -*- coding: utf-8 -*-
+"""
+Gemini (google-generativeai) + Google Cloud TTS + Tkinter dudak senkron PoC
+- GEMINI_API_KEY   : Gemini API anahtarı (env var)
+- GOOGLE_APPLICATION_CREDENTIALS : Google TTS JSON kimlik dosyası yolu (env var)
+
+PyPI:
+  pip install -U google-generativeai google-cloud-texttospeech pygame Pillow python-dotenv
+"""
+
+import os
+import threading
+import tkinter as tk
+from tkinter import font
+
+# --- Ortam (opsiyonel) .env yükleme ---
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # varsa .env dosyasını yükler
+except Exception:
+    pass
+
+# gRPC info loglarını kısmak istersen (opsiyonel):
+os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+os.environ.setdefault("GRPC_TRACE", "")
+
+# --- 3rd-party paketler ---
+try:
+    from PIL import Image, ImageTk
+    import pygame
+    from google.cloud import texttospeech
+    import google.generativeai as genai
+except ImportError:
+    print("Lütfen gerekli kütüphaneleri yükleyin:\n"
+          "pip install Pillow google-cloud-texttospeech pygame google-generativeai python-dotenv")
+    raise
+
+# === DEĞİŞİKLİK BURADA: Model adı en stabil versiyonla güncellendi ===
+MODEL_NAME = "gemini-pro"
+
+
+class GeminiChatApp:
+    """
+    Yeni Google GenAI SDK ile sohbet eder, Google Cloud TTS ile seslendirir
+    ve dudak animasyonunu senkronize eder.
+    """
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Gemini Sohbet Karakteri PoC")
+        self.root.geometry("500x750")
+        self.root.configure(bg="#f0f0f0")
+
+        # Pygame mixer (ses çalma)
+        try:
+            pygame.mixer.init()
+        except Exception as e:
+            print("!!! HATA: pygame.mixer.init başarısız:", e)
+
+        # --- Gemini Model Kurulumu ---
+        self.model = None
+        try:
+            print("1) Gemini başlatılıyor...")
+            gemini_api_key = os.environ.get("GEMINI_API_KEY")
+            if not gemini_api_key:
+                raise ValueError("GEMINI_API_KEY ortam değişkeni tanımlı değil.")
+            genai.configure(api_key=gemini_api_key)
+            self.model = genai.GenerativeModel("gemini-2.5-flash")
+
+            # Hızlı sağlık testi
+            _test = self.model.generate_content("ping")
+            if not getattr(_test, "text", "").strip():
+                raise RuntimeError("Gemini test cevabı boş döndü.")
+            print("2) Gemini hazır.")
+
+        except Exception as e:
+            print(f"!!! HATA: Gemini başlatılamadı: {type(e).__name__}: {e}")
+            self.model = None
+
+        # --- Animasyon ve Çizim Ayarları ---
+        self.is_animating = False
+        self.animation_codes = []
+        self.animation_index = 0
+        self.animation_speed_ms = 90
+
+        self.LINE_COLOR = "#000000"
+        self.LINE_WIDTH = 3
+        self.MOUTH_INTERIOR = "#6b0000"
+
+        self.LETTER_TO_CODE_MAP = {
+            "A": "00101", "K": "00101", "G": "00101", "Ğ": "00101", "E": "01001",
+            "O": "10000", "U": "10010", "Ö": "10001", "Ü": "10001",
+            "I": "01000", "İ": "01000", "Y": "01000", "M": "00000", "B": "00000",
+            "P": "00000", "F": "00011", "V": "00011", "S": "11001", "Z": "11001",
+            "C": "11001", "Ş": "11001", "J": "11001", "Ç": "11001",
+            "D": "00010", "T": "00010", "N": "00010", "L": "00010",
+            "R": "11010", "H": "00001", " ": "00000",
+        }
+        self.MOUTH_MAPPING = {
+            "00000": {"name": "Kapalı", "shape": "line"},
+            "00001": {"name": "Hafif Aralık", "shape": "slightly_parted"},
+            "00010": {"name": "Hafif Açık", "shape": "thin_oval"},
+            "00011": {"name": "Diş-Dudak", "shape": "v_shape_upper_teeth"},
+            "00101": {"name": "Geniş Açık", "shape": "u_shape"},
+            "01000": {"name": "Yayvan Kapalı", "shape": "smile"},
+            "01001": {"name": "Yayvan Açık", "shape": "open_smile"},
+            "10000": {"name": "Büyük O", "shape": "surprised_o"},
+            "10001": {"name": "Küçük O", "shape": "small_o"},
+            "10010": {"name": "Dikey O", "shape": "vertical_oval"},
+            "11001": {"name": "Sessizler", "shape": "sibilant"},
+            "11010": {"name": "Titrek", "shape": "quiver"},
+        }
+
+        self.setup_ui()
+        self.draw_static_face()
+        self.update_face(initial_code="00000")
+
+        if not self.model:
+            self.status_label.config(text="HATA: Gemini API anahtarı geçersiz/eksik ya da bağlantı sorunu.", fg="red")
+
+    # ---------------- UI ---------------- #
+    def setup_ui(self):
+        title_font = font.Font(family="Helvetica", size=16, weight="bold")
+        label_font = font.Font(family="Helvetica", size=12)
+
+        main = tk.Frame(self.root, bg="#f0f0f0")
+        main.pack(pady=20, padx=20, fill="both", expand=True)
+
+        # Girdi
+        inp = tk.Frame(main, bg="#f0f0f0")
+        inp.pack(pady=10)
+        tk.Label(inp, text="Mesajınız:", font=label_font, bg="#f0f0f0").pack(side=tk.LEFT, padx=5)
+        self.text_entry = tk.Entry(inp, width=30, font=label_font)
+        self.text_entry.pack(side=tk.LEFT, padx=5)
+        self.text_entry.bind("<Return>", lambda _: self.start_chat_interaction())
+
+        self.send_button = tk.Button(main, text="Gönder", font=label_font, command=self.start_chat_interaction)
+        self.send_button.pack(pady=5)
+
+        # Canvas
+        self.canvas = tk.Canvas(main, width=400, height=400, bg="white", highlightthickness=0)
+        self.canvas.pack(pady=10)
+
+        # Durum
+        self.status_label = tk.Label(
+            main, text="Durum: Sohbet etmek için bir mesaj yazın",
+            font=title_font, bg="#f0f0f0", fg="#333", wraplength=450
+        )
+        self.status_label.pack(pady=10)
+
+    def draw_static_face(self):
+        img_path = "girl_face.png"
+        if os.path.exists(img_path):
+            try:
+                img = Image.open(img_path).resize((400, 400), Image.Resampling.LANCZOS)
+            except Exception:
+                img = Image.open(img_path).resize((400, 400))
+            self.bg_image = ImageTk.PhotoImage(img)
+            self.canvas.create_image(200, 200, image=self.bg_image)
+        else:
+            self.status_label.config(text="'girl_face.png' bulunamadı! (Yine de çalışır.)", fg="orange")
+
+    # ------------- Akış ------------- #
+    def start_chat_interaction(self):
+        if self.is_animating:
+            print("İşlem reddedildi: Zaten bir animasyon çalışıyor.")
+            return
+        if not self.model:
+            self.status_label.config(text="HATA: Gemini hazır değil.", fg="red")
+            return
+
+        user_prompt = self.text_entry.get().strip()
+        if not user_prompt:
+            self.status_label.config(text="Hata: Lütfen bir mesaj girin!", fg="red")
+            return
+
+        self.text_entry.delete(0, tk.END)
+        self.send_button.config(state=tk.DISABLED)
+        self.status_label.config(text="Düşünüyor...", fg="purple")
+
+        threading.Thread(target=self.get_response_and_speak, args=(user_prompt,), daemon=True).start()
+
+    def get_response_and_speak(self, prompt: str):
+        """Gemini cevabını alır, animasyon kodlarını hazırlar ve TTS oynatır."""
+        try:
+            print(f"Kullanıcı: {prompt}")
+            print("A. Gemini'dan cevap isteniyor...")
+            response = self.model.generate_content(prompt)
+            print("B. Gemini'dan cevap alındı.")
+
+            model_response = getattr(response, "text", "") or ""
+            if not model_response.strip():
+                raise RuntimeError("Gemini boş bir cevap döndürdü.")
+
+            print(f"Gemini Cevabı: {model_response}")
+            self.prepare_and_speak(model_response)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            hint = ""
+            msg = str(e).lower()
+            if "api key" in msg or "permission" in msg or "unauthorized" in msg or "401" in msg:
+                hint = " (İpucu: GEMINI_API_KEY doğru mu? Yetkiler açık mı?)"
+            elif "quota" in msg or "rate" in msg or "429" in msg or "exceeded" in msg:
+                hint = " (İpucu: Kota/Rate-limit olabilir.)"
+            elif "not found" in msg or "model" in msg:
+                hint = " (İpucu: Model adını 'gemini-1.5-flash' yapın.)"
+            elif "deadline" in msg or "timeout" in msg:
+                hint = " (İpucu: Ağ/Firewall kontrol edin.)"
+
+            fallback = "Üzgünüm, bir sorunla karşılaştım" + hint
+            self.prepare_and_speak(fallback)
+
+    def prepare_and_speak(self, text: str):
+        """Metni 5-bit kodlara dönüştür, animasyonu başlat, TTS’i çal."""
+        # Animasyon dizisi
+        self.animation_codes = []
+        prev_code = None
+        for ch in text.upper():
+            code = self.LETTER_TO_CODE_MAP.get(ch, "00000")
+            if code == prev_code:
+                self.animation_codes.append("00000")  # dudak kapanma arası
+            self.animation_codes.append(code)
+            prev_code = code
+
+        self.animation_index = 0
+        self.is_animating = True
+
+        # TTS ve animasyonu başlat
+        self.speak_text_gcloud(text)
+
+    def speak_text_gcloud(self, text: str):
+        """Google Cloud TTS ile ses üret ve çal. Animasyonu root.after ile tetikle."""
+        try:
+            json_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+            if not json_path or not os.path.exists(json_path):
+                raise FileNotFoundError(
+                    f"Google TTS kimlik dosyası bulunamadı. "
+                    f"GOOGLE_APPLICATION_CREDENTIALS='{json_path}'"
+                )
+
+            client = texttospeech.TextToSpeechClient()
+            synthesis_input = texttospeech.SynthesisInput(text=text)
+
+            # Türkçe ses — gerekirse değiştir: tr-TR-Standard-A, tr-TR-Wavenet-B, vb.
+            voice = texttospeech.VoiceSelectionParams(
+                language_code="tr-TR",
+                name="tr-TR-Wavenet-A"
+            )
+
+            audio_config = texttospeech.AudioConfig(
+                audio_encoding=texttospeech.AudioEncoding.MP3,
+                speaking_rate=1.0,
+                pitch=0.0
+            )
+
+            print("D. Google'dan ses verisi isteniyor...")
+            response = client.synthesize_speech(
+                input=synthesis_input, voice=voice, audio_config=audio_config
+            )
+            print("E. Ses verisi başarıyla alındı.")
+
+            out_path = "output.mp3"
+            with open(out_path, "wb") as out:
+                out.write(response.audio_content)
+
+            # Ses çal
+            try:
+                pygame.mixer.music.load(out_path)
+                pygame.mixer.music.play()
+            except Exception as e:
+                print("!!! HATA: pygame.mixer.play:", e)
+
+            # Animasyonu başlat
+            self.root.after(0, self.animate_step)
+
+            # Ses bitene kadar blokla (arkaplan thread'inde)
+            while pygame.mixer.music.get_busy():
+                pygame.time.Clock().tick(10)
+
+        except Exception as e:
+            import traceback
+            print("!!! HATA (TTS):", e)
+            traceback.print_exc()
+        finally:
+            # UI reset ana threade
+            self.root.after(0, self.reset_ui)
+
+    def reset_ui(self):
+        self.is_animating = False
+        self.send_button.config(state=tk.NORMAL)
+        self.update_face(binary_code="00000")
+        if "HATA:" not in self.status_label.cget("text"):
+            self.status_label.config(text="Sohbete hazır", fg="green")
+
+    # ------------- Animasyon ------------- #
+    def animate_step(self):
+        if not self.is_animating or not pygame.mixer.music.get_busy():
+            self.is_animating = False
+            return
+
+        if self.animation_index >= len(self.animation_codes):
+            self.is_animating = False
+            return
+
+        code = self.animation_codes[self.animation_index]
+        self.update_face(binary_code=code)
+        self.animation_index += 1
+        self.root.after(self.animation_speed_ms, self.animate_step)
+
+    def update_face(self, binary_code=None, initial_code=None):
+        code = binary_code if binary_code is not None else initial_code
+        self.canvas.delete("mouth", "cleanup")
+        # Ağız bölgesini temizlemek için beyaz dikdörtgen
+        self.canvas.create_rectangle(150, 245, 250, 285, fill="white", outline="", tags="cleanup")
+
+        info = self.MOUTH_MAPPING.get(code)
+        if info:
+            # Durumu UI thread'inde güncelle
+            if threading.current_thread() is threading.main_thread():
+                self.status_label.config(text=f"Ses: {info['name']} ({code})", fg="#333")
+
+            draw_name = f"draw_mouth_{info['shape']}"
+            draw_fn = getattr(self, draw_name, None)
+            if callable(draw_fn):
+                draw_fn()
+            else:
+                self.draw_mouth_line()
+        else:
+            self.draw_mouth_line()
+
+    # --- Çizim fonksiyonları --- #
+    def draw_mouth_line(self):
+        self.canvas.create_line(170, 265, 230, 265, width=self.LINE_WIDTH,
+                                capstyle=tk.ROUND, fill=self.LINE_COLOR, tags="mouth")
+
+    def draw_mouth_thin_oval(self):
+        self.canvas.create_oval(185, 260, 215, 270, fill=self.MOUTH_INTERIOR,
+                                outline=self.LINE_COLOR, width=2, tags="mouth")
+
+    def draw_mouth_u_shape(self):
+        self.canvas.create_arc(165, 250, 235, 280, start=180, extent=180,
+                               style=tk.CHORD, fill=self.MOUTH_INTERIOR,
+                               outline=self.LINE_COLOR, width=2, tags="mouth")
+
+    def draw_mouth_smile(self):
+        self.canvas.create_arc(170, 245, 230, 270, start=180, extent=180,
+                               style=tk.ARC, outline=self.LINE_COLOR,
+                               width=self.LINE_WIDTH, tags="mouth")
+
+    def draw_mouth_surprised_o(self):
+        self.canvas.create_oval(185, 255, 215, 285, fill=self.MOUTH_INTERIOR,
+                                outline=self.LINE_COLOR, width=2, tags="mouth")
+
+    def draw_mouth_quiver(self):
+        self.canvas.create_line(170, 267, 185, 263, 200, 269, 215, 263, 230, 267,
+                                width=self.LINE_WIDTH, smooth=True,
+                                fill=self.LINE_COLOR, tags="mouth")
+
+    def draw_mouth_small_o(self):
+        self.canvas.create_oval(190, 260, 210, 275, fill=self.MOUTH_INTERIOR,
+                                outline=self.LINE_COLOR, width=2, tags="mouth")
+
+    def draw_mouth_vertical_oval(self):
+        self.canvas.create_oval(190, 250, 210, 280, fill=self.MOUTH_INTERIOR,
+                                outline=self.LINE_COLOR, width=2, tags="mouth")
+
+    def draw_mouth_open_smile(self):
+        self.canvas.create_arc(165, 245, 235, 280, start=180, extent=180,
+                               style=tk.CHORD, fill=self.MOUTH_INTERIOR,
+                               outline=self.LINE_COLOR, width=2, tags="mouth")
+
+    def draw_mouth_sibilant(self):
+        self.canvas.create_rectangle(170, 263, 230, 268, fill="white",
+                                     outline=self.LINE_COLOR, width=1, tags="mouth")
+
+    def draw_mouth_v_shape_upper_teeth(self):
+        self.draw_mouth_sibilant()
+        self.canvas.create_line(170, 275, 230, 275, width=self.LINE_WIDTH,
+                                capstyle=tk.ROUND, fill=self.LINE_COLOR, tags="mouth")
+
+    def draw_mouth_slightly_parted(self):
+        self.canvas.create_line(170, 263, 230, 267, width=self.LINE_WIDTH - 1,
+                                capstyle=tk.ROUND, fill=self.LINE_COLOR, tags="mouth")
+        self.canvas.create_line(170, 267, 230, 263, width=self.LINE_WIDTH - 1,
+                                capstyle=tk.ROUND, fill=self.LINE_COLOR, tags="mouth")
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = GeminiChatApp(root)
+    root.mainloop()
+
